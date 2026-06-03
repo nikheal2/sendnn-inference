@@ -245,6 +245,12 @@ class SpyrePlatform(Platform):
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "sendnn_inference.v1.worker.spyre_worker.SpyreWorker"
 
+        # Use SpyreExecutor for multi-worker scenarios to enable MM de-duplication
+        if parallel_config.distributed_executor_backend == "auto":
+            parallel_config.distributed_executor_backend = (
+                "sendnn_inference.v1.executor.spyre_executor.SpyreExecutor"
+            )
+
         cls._check_threading_config(parallel_config.world_size)
 
         # set env vars based on the model

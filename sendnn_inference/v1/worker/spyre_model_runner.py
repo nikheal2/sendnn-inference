@@ -154,6 +154,9 @@ class BaseSpyreModelRunner(ABC, Generic[InputBatchT, RequestStateT, ModelInputsT
         # Requests
         self.requests: dict[str, RequestStateT] = {}
 
+        # MM coordinator for vision encoder de-duplication (ADR-001)
+        self._mm_coordinator: Any | None = None
+
     @abstractmethod
     def build_input_batch(self) -> InputBatchT:
         raise NotImplementedError
@@ -179,6 +182,116 @@ class BaseSpyreModelRunner(ABC, Generic[InputBatchT, RequestStateT, ModelInputsT
         if not self.is_multimodal:
             return None
         return self.model.mm_model_utils
+    
+
+    def set_mm_coordinator(self, coordinator) -> None:
+        """Set the MM coordinator for vision encoder de-duplication.
+        Args:
+            coordinator: MMCoordinator instance
+        """
+        self._mm_coordinator = coordinator
+
+    def get_maybe_mm_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        mm_features: list | None,
+        is_decode: bool,
+        request_id: str | None = None,
+    ) -> torch.Tensor:
+        """Get multimodal embeddings, using coordinator if available.
+        On rank-0: Directly calls model's get_maybe_mm_embeddings
+        On other ranks: Fetches from coordinator via IPC
+        Args:
+            input_ids: Token IDs (batched)
+            mm_features: MultiModalFeatureSpec list or single spec
+            is_decode: Whether this is a decode step
+            request_id: Unique request identifier for coordinator lookup
+        Returns:
+            embeddings: Tensor of shape (batch, seq_len, hidden_dim)
+        """
+        if not mm_features:
+            # No multimodal features - use standard embedding lookup
+            # This path is for text-only requests
+            assert self._model is not None
+            return self.model.get_maybe_mm_embeddings(
+                input_ids,
+                mm_features=None,
+                is_decode=is_decode,
+            )
+
+        # Normalize mm_features to a list if it's a single spec
+        if not isinstance(mm_features, list):
+            mm_features_list = [mm_features]
+        else:
+            mm_features_list = mm_features
+
+        # Multimodal request - use coordinator for de-duplication
+        # Skip coordinator for warmup requests (request_id starts with "warmup-")
+        use_coordinator = (
+            self._mm_coordinator is not None
+            and request_id is not None
+            and not request_id.startswith("warmup-")
+        )
+
+        logger.info(
+            "[COORDINATOR-CHECK] req_id=%s, has_coordinator=%s, req_id_valid=%s, not_warmup=%s, use_coordinator=%s",
+            request_id[:8] if request_id else "None",
+            self._mm_coordinator is not None,
+            request_id is not None,
+            not request_id.startswith("warmup-") if request_id else False,
+            use_coordinator
+        )
+
+        if use_coordinator:
+            # Use coordinator for de-duplication with BLOCKING wait
+            # Encoding was submitted proactively, so we only wait for remaining time
+            try:
+                logger.debug(
+                    "[COORDINATOR] Waiting for MM embedding for %s",
+                    request_id[:8]
+                )
+                embeddings = self._mm_coordinator.get_embedding(
+                    request_id=request_id,
+                    input_ids=input_ids.squeeze(0),
+                    mm_features=mm_features_list[0],
+                )
+                logger.debug(
+                    "[COORDINATOR] Got MM embedding for %s, shape=%s",
+                    request_id[:8], embeddings.shape
+                )
+
+            except Exception as e:
+                logger.error(
+                    "[FATAL] Rank %d: get_embedding() failed for %s: %s",
+                    getattr(self, 'rank', -1), request_id, e, exc_info=True
+                )
+                raise
+
+            # Coordinator returns embeddings on CPU - move to correct device
+            if embeddings.device != self.device:
+                embeddings = embeddings.to(self.device)
+        else:
+            # No coordinator (warmup or fallback) - direct call
+            logger.info("[FALLBACK] Using direct model call (coordinator not available)")
+            assert self._model is not None
+            embeddings = self.model.get_maybe_mm_embeddings(
+                input_ids,
+                mm_features=mm_features_list,
+                is_decode=is_decode,
+            )
+
+        # Ensure embeddings have batch dimension: (batch, seq_len, hidden_dim)
+        if embeddings.ndim == 2:
+            embeddings = embeddings.unsqueeze(0)
+        elif embeddings.ndim == 3:
+            pass  # Already correct
+        else:
+            raise ValueError(
+                f"Unexpected embeddings shape: {embeddings.shape}, ndim={embeddings.ndim}"
+            )
+
+        return embeddings
+
 
     @abstractmethod
     def load_model(self) -> None:
@@ -377,6 +490,9 @@ class SpyrePoolingModelRunner(
     def vocab_size(self) -> int:
         # self.model here is probably a transformers model class
         return self.model.config.vocab_size  # ty: ignore[invalid-return-type]
+    
+        # Note: MM coordinator model setting is handled in SpyreWorker.initialize_mm_coordinator()
+        # after the coordinator is fully initialized
 
     def _prepare_pad_input_ids(
         self,
@@ -993,7 +1109,7 @@ class ChunkedPrefillModelRunner(
             chunk_start, chunk_end
         )
 
-        logger.debug(
+        logger.info(
             "Chunked prefill of request '%s' %d:%d of %d tokens",
             req_id,
             chunk_start,
@@ -1041,15 +1157,24 @@ class ChunkedPrefillModelRunner(
             ).unsqueeze(0)
 
             t0 = time.time()
-            full_embeds = self.model.get_maybe_mm_embeddings(
-                full_input_tokens,
+            logger.info("[TIMING-RUNNER] Starting get_maybe_mm_embeddings for %s (DEFERRED)", req_id[:8])
+
+
+            # Use coordinator for de-duplication if available (ADR-001)
+            # Blocking: waits for encoding to complete (encoding was submitted early)
+            full_embeds = self.get_maybe_mm_embeddings(
+                input_ids=full_input_tokens,
                 mm_features=mm_features,
                 is_decode=False,
+                request_id=req_id,
             )
+
+            t_after_get = time.time()
+            logger.info("[TIMING-RUNNER] get_maybe_mm_embeddings returned in %.2fms", (t_after_get - t0) * 1000)
 
             t_elapsed = time.time() - t0
 
-            logger.info("maybe_mm_embedding processing time: %.2fms", (t_elapsed * 1000))
+            logger.info("maybe_mm_embedding processing time: %.2fms (ready)", (t_elapsed * 1000))
             self.perf_logger.log(
                 "get_mm_embeddings_time_ms",
                 t_elapsed * 1000,
@@ -1062,8 +1187,8 @@ class ChunkedPrefillModelRunner(
             request.cached_mm_embeddings = full_embeds
             logger.debug("Computed and cached full multimodal embeddings for request '%s'", req_id)
 
-        # Slice the cached embeddings for this chunk
-        if request.cached_mm_embeddings is not None:
+        # Slice the cached embeddings for this chunk (if already computed)
+        if mm_features and request.cached_mm_embeddings is not None:
             # Extract the slice corresponding to this chunk
             # Add left padding to align with the chunked token positions
             full_embeds = request.cached_mm_embeddings
@@ -1081,7 +1206,7 @@ class ChunkedPrefillModelRunner(
                 full_embeds[0, chunk_start:chunk_end]
             )
 
-            logger.debug(
+            logger.info(
                 "Sliced embeddings for chunk %d of request '%s': [%d:%d] -> [%d:%d]",
                 chunk_i,
                 req_id,
@@ -1287,6 +1412,27 @@ class ChunkedPrefillModelRunner(
         is_new_batch = self.input_batch.num_reqs == 0
         prompt_len = len(prompt_token_ids)
         mm_features = getattr(request, "mm_features", None)
+
+        # ADR-001: Proactively submit MM encoding on rank-0 as early as possible
+        # This allows encoding to run in background while we process prefill chunks
+        if (
+            mm_features
+            and self._mm_coordinator is not None
+            and self.rank == 0
+            and not req_id.startswith("warmup-")
+        ):
+            full_input_tokens = torch.tensor(
+                prompt_token_ids, dtype=torch.int64, device=self.device
+            )
+            logger.info(
+                "[EARLY-SUBMIT] Rank-0 submitting MM encoding for %s at add_new_request()",
+                req_id[:8]
+            )
+            self._mm_coordinator.submit_encoding(
+                request_id=req_id,
+                input_ids=full_input_tokens,
+                mm_features=mm_features if isinstance(mm_features, list) else [mm_features],
+            )
 
         self.prefill_batch.clear_requests()
 
@@ -1511,7 +1657,7 @@ class ChunkedPrefillModelRunner(
         scheduler_output: SchedulerOutput,
         **kwargs,
     ) -> ModelRunnerOutput:
-        t0 = time.time()
+        t_execute_start = time.time()
 
         self.update_states(scheduler_output)
 
@@ -1522,7 +1668,13 @@ class ChunkedPrefillModelRunner(
         # Initialize internal request states if this is the first chunk of a very new prefill
         self.maybe_setup_new_prefill(scheduler_output)
 
+        t_prep_start = time.time()
         model_input = self.prepare_model_input(scheduler_output)
+        t_prep_elapsed = (time.time() - t_prep_start) * 1000
+
+        # If None, MM encoding not ready - return empty output and scheduler will retry
+        if model_input is None:
+            return self.get_empty_output()        
         is_prefill = model_input.is_prompt
 
         # Execute the model
@@ -1543,6 +1695,8 @@ class ChunkedPrefillModelRunner(
                 f" tkv: {self.tkv}, batch_size: {len(scheduler_output.num_scheduled_tokens)}"
             )
 
+            t_forward_start = time.time()
+
             logits = self.model(
                 input_ids_or_embeds=input_ids_or_embeds,
                 positions=model_input.input_positions,
@@ -1550,6 +1704,8 @@ class ChunkedPrefillModelRunner(
                 is_prompt=model_input.is_prompt,
             )
 
+            t_forward_elapsed = (time.time() - t_forward_start) * 1000
+        
         # If the prompt is being prefilled we don't have to sample
         # and generate a new token.
         if is_prefill and self.check_incomplete_prefill(scheduler_output):
@@ -1557,16 +1713,18 @@ class ChunkedPrefillModelRunner(
             if not self.is_driver_worker:
                 return self.get_empty_output()
 
-            t1 = time.time() - t0
-            logger.debug("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", (t1 * 1000))
+            t_execute_elapsed = (time.time() - t_execute_start) * 1000
+            logger.info("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", t_execute_elapsed)
             return self.prefill_output()
 
         # Apply grammar bitmask for structured output requests.
+        t_grammar_start = time.time()
         self.apply_grammar_bitmask(
             scheduler_output,
             logits,
             self.prefill_batch if is_prefill else self.input_batch,
         )
+        t_grammar_elapsed = (time.time() - t_grammar_start) * 1000
 
         # Sample the next token.
         output: SamplerOutput | None = self.model.sample(
@@ -1575,10 +1733,19 @@ class ChunkedPrefillModelRunner(
         )
         assert output is not None, "Expected sampler output"
 
-        t1 = time.time() - t0
-        batch_size = model_input.input_tokens.shape[0]
+        t_sample_elapsed = (time.time() - t_sample_start) * 1000
+
+        t_execute_elapsed = (time.time() - t_execute_start) * 1000
+        batch_size = model_input.input_tokens.shape[0] if model_input.input_tokens is not None else 1
         step_type = "[prefill last chunk]" if is_prefill else "[decode]"
-        logger.debug("t_token: %.2fms %s[batch size %d]", (t1 * 1000), step_type, batch_size)
+
+        # ITL measurement log - only for driver worker on decode steps
+        if not is_prefill and self.is_driver_worker:
+            logger.info(
+                "[ITL] total=%.2fms (prep=%.2fms, forward=%.2fms, grammar=%.2fms, sample=%.2fms) %s[batch=%d]",
+                t_execute_elapsed, t_prep_elapsed, t_forward_elapsed,
+                t_grammar_elapsed, t_sample_elapsed, step_type, batch_size
+            )
 
         # Get the right batch, if this is the last chunk to conclude the
         # prefill, we'll generate a token and we should get from the prefill

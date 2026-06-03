@@ -2,7 +2,7 @@
 
 import math
 from collections import deque
-from typing import TYPE_CHECKING, Iterable, Union
+from typing import TYPE_CHECKING, Callable, Iterable, Union, Optional, Any
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -40,6 +40,22 @@ class SpyreScheduler(Scheduler):
         super().__init__(*args, **kwargs)
         self.model_config = self.vllm_config.model_config
 
+    def add_request(self, request: Request) -> None:
+        """Add request to scheduler.
+        Note: MM encoding is triggered from SpyreExecutor.execute_model() when
+        requests are scheduled, not here. This is because the scheduler runs in
+        EngineCore (separate process) where we can't access the submission queue.
+        """
+        # Add to scheduler's internal queues
+        super().add_request(request)
+
+        # Log MM request arrival for diagnostics
+        mm_features = getattr(request, "mm_features", None)
+        if mm_features:
+            logger.info(
+                "MM Request arrived at scheduler: %s (encoding will be triggered from executor)",
+                request.request_id
+            )    
 
 class PoolingSpyreScheduler(SpyreScheduler):
     """Support of pooling models"""
@@ -230,12 +246,36 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
                 )
 
         # Remove completed prefills
+        completed_prefills = [
+            req.request_id for req in self.ongoing_prefills
+            if req.num_computed_tokens >= req.num_prompt_tokens
+        ]
+        if completed_prefills:
+            logger.info("[DIAGNOSTIC] Removing completed prefills: %s", completed_prefills)
+
         self.ongoing_prefills = [
             req for req in self.ongoing_prefills if req.num_computed_tokens < req.num_prompt_tokens
         ]
 
         self.tkv = model_runner_output.tkv
-        return super(SpyreScheduler, self).update_from_output(scheduler_output, model_runner_output)
+        
+
+        # Call parent update
+        result = super(SpyreScheduler, self).update_from_output(scheduler_output, model_runner_output)
+
+        # DIAGNOSTIC: Check if finished requests were actually removed
+        if hasattr(scheduler_output, 'finished_req_ids') and scheduler_output.finished_req_ids:
+            still_running = [
+                req_id for req_id in scheduler_output.finished_req_ids
+                if any(req.request_id == req_id for req in self.running)
+            ]
+            if still_running:
+                logger.warning(
+                    "[DIAGNOSTIC] BUG DETECTED: Finished requests still in running queue: %s",
+                    still_running
+                )
+
+        return result        
 
     def adjust_computed_tokens(
         self, computed_tokens: int, left_padding: int, prefix_cache_len: int
@@ -275,15 +315,9 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
 
         # Check if new requests can be scheduled for prefill
         while holdback_queue:
-            if self.can_schedule_prefill(holdback_queue[0]):
+            can_schedule = self.can_schedule_prefill(holdback_queue[0])
+            if can_schedule:
                 new_request = holdback_queue.popleft()
-
-                logger.debug(
-                    "Scheduling a new request (%d prompt tokens), holding back %d requests",
-                    new_request.num_prompt_tokens,
-                    len(holdback_queue),
-                )
-
                 # Add request to the waiting queue
                 self.waiting.append(new_request)
             else:
@@ -359,6 +393,14 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         # delegate to super of SpyreScheduler: base V1 Scheduler
         outputs = super(SpyreScheduler, self).schedule()
 
+        logger.info(
+            "[SCHEDULE-DEBUG] Parent scheduler returned: num_scheduled_tokens=%s, scheduled_new_reqs=%d, scheduled_resumed_reqs=%d, scheduled_running_reqs=%d",
+            outputs.num_scheduled_tokens if hasattr(outputs, 'num_scheduled_tokens') else "N/A",
+            len(outputs.scheduled_new_reqs) if hasattr(outputs, 'scheduled_new_reqs') else 0,
+            len(outputs.scheduled_resumed_reqs) if hasattr(outputs, 'scheduled_resumed_reqs') else 0,
+            len(outputs.scheduled_running_reqs) if hasattr(outputs, 'scheduled_running_reqs') else 0
+        )        
+
         # Track as ongoing prefills only the requests that were actually
         # scheduled (i.e., moved from waiting to running by the base
         # scheduler).
@@ -393,10 +435,23 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         if len(self.running) + len(self.waiting) == 0:
             return True
 
-        if not self._has_scheduling_priority(request):
+        has_priority = self._has_scheduling_priority(request)
+        if not has_priority:
+            logger.info(
+                "[SCHEDULE-DEBUG] can_schedule_prefill=False for %s: no priority (previous_prefill=%s, decoding_reqs=%d)",
+                request.request_id[:12],
+                self.previous_step_was_prefill,
+                len([r for r in self.running if r not in self.ongoing_prefills])
+            )
             return False
 
-        return self._satisfies_constraints(request)
+        satisfies = self._satisfies_constraints(request)
+        if not satisfies:
+            logger.info(
+                "[SCHEDULE-DEBUG] can_schedule_prefill=False for %s: constraints not satisfied",
+                request.request_id[:12]
+            )
+        return satisfies
 
     def _satisfies_constraints(self, request: Request) -> bool:
         # Use a local variable to check the prefix cache hit length ahead of time without mutating
@@ -439,11 +494,12 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         # if the decode batch is full, but the current implementation of input
         # batch doesn't allow to do so.
         num_running = len(self.running)
-        cond1 = num_running + len(self.waiting) < self.max_num_running_reqs
+        num_waiting = len(self.waiting)
+        cond1 = num_running + num_waiting < self.max_num_running_reqs
 
         # check that there is space in the prefill batch
         max_prefill_batch_size = 1
-        cond2 = len(self.waiting) < max_prefill_batch_size
+        cond2 = num_waiting < max_prefill_batch_size
 
         return cond1 and cond2
 

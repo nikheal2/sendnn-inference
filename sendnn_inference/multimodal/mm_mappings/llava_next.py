@@ -12,14 +12,9 @@ from vllm.multimodal.inputs import (
 
 from sendnn_inference.multimodal.mm_mappings import MMUtilsBase, MMWarmupInputs
 
-# Extend the adapter as part of the head dim fix; this is needed to
-# load 2b models correctly, but we do it here since this class is
-# currently initialized only once and the adapter extension does not
-# seem to be idempotent.
-#
-# NOTE: If this is made idempotent, we can move this into
-# get_mm_specific_load_overrides(), since it's needed to load.
-serialization.extend_adapter("llava_next", "hf", ["weight_expansion_for_mismatched_head_dim"])
+# Track whether the adapter has been extended (module-level flag)
+_LLAVA_ADAPTER_EXTENDED = False
+
 
 
 class LlavaNextMMUtils(MMUtilsBase):
@@ -59,6 +54,15 @@ class LlavaNextMMUtils(MMUtilsBase):
         TODO: If additional variants of granite vision are added, or broader
         llava next support is added in FMS, handle it properly here.
         """
+
+        # Extend the adapter lazily on first call to avoid import-time errors.
+        # This must happen before get_model() is called in spyre.py.
+        global _LLAVA_ADAPTER_EXTENDED
+        if not _LLAVA_ADAPTER_EXTENDED:
+            serialization.extend_adapter(
+                "llava_next", "hf", ["weight_expansion_for_mismatched_head_dim"]
+            )
+            _LLAVA_ADAPTER_EXTENDED = True
         return {
             "override_hf_pretrained_config": True,
             "text_config": {"head_dim": 128},

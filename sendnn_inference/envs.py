@@ -152,6 +152,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
             _CPU_MM_DTYPE_PLATFORM_DEFAULTS.get(platform.machine(), "float16"),
         )
     ),
+        # Port for the MM coordinator socket server used for inter-worker
+    # communication during vision encoder de-duplication.
+    "SPYRE_MM_COORD_PORT": lambda: int(os.getenv("SPYRE_MM_COORD_PORT", "15799")),
+    # Maximum number of MM requests to batch together for vision encoding.
+    # Higher values increase utilization but add latency from waiting.
+    "SPYRE_MM_MAX_BATCH_SIZE": lambda: int(os.getenv("SPYRE_MM_MAX_BATCH_SIZE", "4")),
+    # Maximum time in milliseconds to wait for additional MM requests
+    # before submitting a batch for encoding. Trade-off between latency
+    # and batch utilization.
+    "SPYRE_MM_BATCH_WAIT_MS": lambda: int(os.getenv("SPYRE_MM_BATCH_WAIT_MS", "30")),
 }
 # --8<-- [end:env-vars-definition]
 

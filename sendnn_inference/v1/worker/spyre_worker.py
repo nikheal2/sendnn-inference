@@ -9,9 +9,10 @@ import signal
 import sys
 import time
 import math
+import multiprocessing as mp
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Union, cast
+from typing import TYPE_CHECKING, Any, List, Optional, Union, cast
 
 import torch
 import torch.distributed as dist
@@ -47,6 +48,7 @@ from sendnn_inference.v1.worker.spyre_model_runner import (
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput
+    from sendnn_inference.multimodal.mm_coordinator import MMCoordinator
 
 
 logger = init_logger(__name__)
@@ -267,6 +269,7 @@ class SpyreWorker(WorkerBase):
             SpyrePoolingModelRunner,
         ]
         self.warmup_block_ids = 1
+        self.mm_coordinator: MMCoordinator | None = None
         if self.is_pooling:
             self.model_runner = SpyrePoolingModelRunner(
                 self.vllm_config, self.is_driver_worker, self.rank
@@ -414,6 +417,119 @@ class SpyreWorker(WorkerBase):
         load_model_total_t = load_model_end_t - load_model_start_t
         self.perf_metrics.log("load model time", load_model_total_t, model=self.model_config.model)
         logger.info("load model took %.3fs", load_model_total_t)
+
+        # MM coordinator initialization and model setting is handled by the executor via collective_rpc
+        # in initialize_mm_coordinator() which is called after load_model()
+        # after workers are spawned. This ensures queues are properly inherited.
+        # See SpyreExecutor._post_init_executor() for details.
+
+    def initialize_mm_coordinator(
+        self,
+        submission_queue: Optional[Any] = None,
+        result_queues: Optional[List[Any]] = None,
+    ) -> None:
+        """Initialize the MM coordinator on this worker.
+        Called via collective_rpc after workers are spawned.
+        Receives Manager queue proxies as parameters (picklable).
+        Args:
+            submission_queue: Queue for submitting encoding requests (all workers receive this)
+            result_queues: List of all result queues (all workers receive this)
+        """
+        logger.info("initialize_mm_coordinator called on rank %d", self.rank)
+
+        # Note: We initialize the coordinator even if is_multimodal is not yet set,
+        # because this is called before model load. The coordinator will only be used
+        # if multimodal requests actually arrive.
+
+        from sendnn_inference.multimodal.mm_coordinator import MMCoordinator, cleanup_stale_shared_memory
+
+        tp_size = self.parallel_config.tensor_parallel_size
+        is_rank0 = (self.rank % tp_size == 0)
+
+        # Validate we have the queues we need
+        if result_queues is None:
+            logger.error(
+                "No result_queues for rank %d - cannot initialize coordinator",
+                self.rank
+            )
+            return
+
+        # Use TP-local rank to index into result_queues
+        # result_queues has tp_size elements (e.g., 4 for TP=4)
+        # self.rank might be global rank, so use modulo to get TP-local rank
+        tp_local_rank = self.rank % tp_size
+
+        if len(result_queues) <= tp_local_rank:
+            logger.error(
+                "Insufficient result_queues for rank %d (tp_local=%d, queues=%d)",
+                self.rank, tp_local_rank, len(result_queues)
+            )
+            return
+
+        # Extract this worker's result queue using TP-local rank
+        result_queue = result_queues[tp_local_rank]
+
+        logger.info(
+            "Rank %d (tp_local=%d) using result_queue index %d",
+            self.rank, tp_local_rank, tp_local_rank
+        )
+
+        if is_rank0 and submission_queue is None:
+            logger.error(
+                "Rank-0 missing submission_queue - cannot initialize coordinator"
+            )
+            return
+
+        # Clean up any stale shared memory from crashed runs
+        cleanup_stale_shared_memory()
+
+        logger.info(
+            "Rank %d: is_rank0=%s, has_submission_queue=%s, has_result_queues=%s, has_result_queue=%s",
+            self.rank, is_rank0, submission_queue is not None,
+            result_queues is not None, result_queue is not None
+        )
+
+        # Create coordinator
+        self.mm_coordinator = MMCoordinator(
+            is_rank0=is_rank0,
+            model_runner=self.model_runner if is_rank0 else None,
+            tp_size=tp_size,
+            submission_queue=submission_queue if is_rank0 else None,
+            result_queues=result_queues if is_rank0 else None,
+            result_queue=result_queue,
+        )
+
+        # Start coordinator
+        self.mm_coordinator.start()
+
+        # Pass coordinator to model runner
+        self.model_runner.set_mm_coordinator(self.mm_coordinator)
+
+        # Set model and utils on coordinator (rank-0 only, after model is loaded)
+        if is_rank0 and hasattr(self.model_runner, 'model') and self.model_runner.model is not None:
+            logger.info(
+                "Setting FMS model and MM utils on coordinator (rank-0): has_fms_model=%s, has_mm_utils=%s",
+                hasattr(self.model_runner.model, 'fms_model'),
+                hasattr(self.model_runner.model, 'mm_model_utils')
+            )
+            if hasattr(self.model_runner.model, 'fms_model') and hasattr(self.model_runner.model, 'mm_model_utils'):
+                self.mm_coordinator.set_model_and_utils(
+                    fms_model=self.model_runner.model.fms_model,
+                    mm_model_utils=self.model_runner.model.mm_model_utils,
+                )
+                logger.info("Model and utils set on coordinator successfully")
+            else:
+                logger.warning("Model does not have fms_model or mm_model_utils attributes")
+
+        logger.info("MM coordinator initialization complete on rank %d", self.rank)
+
+    def shutdown_mm_coordinator(self) -> None:
+        """Shutdown the MM coordinator.
+        Called via collective_rpc by the executor during shutdown.
+        """
+        if self.mm_coordinator is not None:
+            self.mm_coordinator.shutdown()
+            logger.info("MM coordinator shutdown complete on rank %d", self.rank)
 
     def _gen_warmup_block_ids(self, num_tokens: int) -> tuple[list[int]]:
         num_blocks = math.ceil(num_tokens / 64)
@@ -783,6 +899,15 @@ class SpyreWorker(WorkerBase):
         if self.profiler is not None:
             self.profiler.step()
         output = self.model_runner.execute_model(scheduler_output)
+
+        # Release MM coordinator resources for finished requests (rank-0 only)
+        if self.rank == 0 and self.mm_coordinator and scheduler_output.finished_req_ids:
+            for req_id in scheduler_output.finished_req_ids:
+                try:
+                    self.mm_coordinator.release(req_id)
+                except Exception as e:
+                    logger.warning("Failed to release MM coordinator resources for %s: %s", req_id, e)
+                    
         return output if self.is_driver_worker else None
 
     def _get_num_tokens(self, r: NewRequestData) -> int:
