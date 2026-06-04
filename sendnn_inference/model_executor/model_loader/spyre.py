@@ -1,6 +1,5 @@
 """Utilities for selecting and loading Spyre models."""
 
-import contextlib
 import os
 from dataclasses import dataclass
 from typing import cast
@@ -520,31 +519,29 @@ class SpyreCausalLM(nn.Module):
         # Delegate to this model architecture's multimodal helpers to
         # get the (potentially) multimodal embeddings from the FMS model.
         fms_model = self.fms_model
-
-        # The vision encoder runs on nnpa (not Spyre), which supports
-        # torch.inference_mode(); use it for the encoder forward when enabled.
-        # The outer execute path runs under torch.no_grad() (see
-        # SpyrePlatform.inference_mode), and nesting inference_mode is allowed.
-        use_inference_mode = (
-            envs_spyre.SENDNN_INFERENCE_MM_INFERENCE_MODE
-            and bool(mm_features)
-            and self.mm_device == "nnpa"
+        return self.mm_model_utils.get_maybe_mm_embeddings(
+            fms_model,
+            input_ids,
+            mm_features,
+            is_decode,
+            self.mm_device,
         )
-        ctx = torch.inference_mode() if use_inference_mode else contextlib.nullcontext()
-        with ctx:
-            embeds = self.mm_model_utils.get_maybe_mm_embeddings(
-                fms_model,
-                input_ids,
-                mm_features,
-                is_decode,
-                self.mm_device,
-            )
-        # Materialize inference tensors into normal tensors so the model
-        # runner's cross-iteration caching + slicing of the embeddings stays
-        # legal (inference tensors cannot be reused outside inference_mode).
-        if use_inference_mode and embeds is not None:
-            embeds = embeds.clone()
-        return embeds
+
+    def use_mm_inference_mode(self, mm_features) -> bool:
+        """Whether the multimodal vision-encoder forward should run under
+        torch.inference_mode().
+
+        True only when enabled via SENDNN_INFERENCE_MM_INFERENCE_MODE and the
+        encoder runs on the nnpa device, which (unlike the Spyre compiled
+        backend) supports inference_mode. The model runner consults this at the
+        encoder call site; see SpyreModelRunner._prepare_prompt.
+        """
+        return (
+            self.is_multimodal
+            and self.mm_device == "nnpa"
+            and bool(mm_features)
+            and envs_spyre.SENDNN_INFERENCE_MM_INFERENCE_MODE
+        )
 
     def sample(
         self,

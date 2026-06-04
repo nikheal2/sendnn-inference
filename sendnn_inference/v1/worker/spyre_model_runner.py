@@ -1,3 +1,4 @@
+import contextlib
 import math
 import time
 from abc import ABC, abstractmethod
@@ -1041,11 +1042,22 @@ class ChunkedPrefillModelRunner(
             ).unsqueeze(0)
 
             t0 = time.time()
-            full_embeds = self.model.get_maybe_mm_embeddings(
-                full_input_tokens,
-                mm_features=mm_features,
-                is_decode=False,
-            )
+            # The vision encoder runs on nnpa (not Spyre), which supports
+            # torch.inference_mode(); the outer execute path is under no_grad
+            # and nesting inference_mode is allowed.
+            use_inference_mode = self.model.use_mm_inference_mode(mm_features)
+            ctx = torch.inference_mode() if use_inference_mode else contextlib.nullcontext()
+            with ctx:
+                full_embeds = self.model.get_maybe_mm_embeddings(
+                    full_input_tokens,
+                    mm_features=mm_features,
+                    is_decode=False,
+                )
+            # Materialize out of inference mode so the cross-iteration caching +
+            # slicing below stays legal (inference tensors can't be reused
+            # outside inference_mode).
+            if use_inference_mode and full_embeds is not None:
+                full_embeds = full_embeds.clone()
 
             t_elapsed = time.time() - t0
 

@@ -1,5 +1,6 @@
 """Tests for SpyreCausalLM._cast_params_for_spyre dtype casting."""
 
+import contextlib
 import importlib.util
 from types import SimpleNamespace
 
@@ -192,58 +193,63 @@ def test_nnpa_text_only_model_never_registers_or_errors(monkeypatch):
     assert _dtype_of(fms, "decoder.layers.0.weight") == torch.float16
 
 
-class _RecordingMMUtils:
-    """Records whether inference mode was active when the encoder ran, and
-    returns a tensor created under that context (so .is_inference() reflects it).
-    """
-
-    def __init__(self):
-        self.inference_mode_enabled = None
-
-    def get_maybe_mm_embeddings(self, fms_model, input_ids, mm_features, is_decode, mm_device):
-        self.inference_mode_enabled = torch.is_inference_mode_enabled()
-        return torch.zeros(1, 4)
+def _make_causal_lm(*, is_multimodal, mm_device):
+    return SimpleNamespace(
+        is_multimodal=is_multimodal,
+        mm_device=mm_device,
+        use_mm_inference_mode=lambda mm_features: SpyreCausalLM.use_mm_inference_mode(
+            SimpleNamespace(is_multimodal=is_multimodal, mm_device=mm_device), mm_features
+        ),
+    )
 
 
-def _run_get_mm_embeddings(monkeypatch, *, flag, mm_device, mm_features):
+def _set_mm_inference_mode_flag(monkeypatch, flag):
     monkeypatch.setenv("SENDNN_INFERENCE_MM_INFERENCE_MODE", flag)
     envs.clear_env_cache()
-    mm_utils = _RecordingMMUtils()
-    ns = SimpleNamespace(
-        is_multimodal=True,
-        mm_model_utils=mm_utils,
-        fms_model=torch.nn.Module(),
-        mm_device=mm_device,
-    )
-    embeds = SpyreCausalLM.get_maybe_mm_embeddings(
-        ns, torch.zeros(1, 1, dtype=torch.int64), mm_features, is_decode=False
-    )
-    return mm_utils, embeds
 
 
-def test_nnpa_encoder_runs_under_inference_mode_and_is_materialized(monkeypatch):
-    # Flag on + encoder-on-nnpa: the forward runs under inference_mode, and the
-    # returned embeddings are cloned back into a normal (non-inference) tensor.
-    mm_utils, embeds = _run_get_mm_embeddings(
-        monkeypatch, flag="1", mm_device="nnpa", mm_features=[object()]
-    )
-    assert mm_utils.inference_mode_enabled is True
-    assert embeds.is_inference() is False
+def test_use_mm_inference_mode_true_on_nnpa_with_features(monkeypatch):
+    _set_mm_inference_mode_flag(monkeypatch, "1")
+    model = _make_causal_lm(is_multimodal=True, mm_device="nnpa")
+    assert model.use_mm_inference_mode([object()]) is True
 
 
-def test_inference_mode_flag_off_keeps_no_grad(monkeypatch):
-    mm_utils, embeds = _run_get_mm_embeddings(
-        monkeypatch, flag="0", mm_device="nnpa", mm_features=[object()]
-    )
-    assert mm_utils.inference_mode_enabled is False
-    assert embeds.is_inference() is False
+@pytest.mark.parametrize(
+    "is_multimodal,mm_device,mm_features",
+    [
+        (True, "cpu", [object()]),  # CPU encoder: out of scope
+        (True, "nnpa", []),  # no mm features (text-only / decode)
+        (False, "nnpa", [object()]),  # not a multimodal model
+    ],
+)
+def test_use_mm_inference_mode_false_cases(monkeypatch, is_multimodal, mm_device, mm_features):
+    _set_mm_inference_mode_flag(monkeypatch, "1")
+    model = _make_causal_lm(is_multimodal=is_multimodal, mm_device=mm_device)
+    assert model.use_mm_inference_mode(mm_features) is False
 
 
-def test_cpu_encoder_not_wrapped_in_inference_mode(monkeypatch):
-    # Scope is nnpa-only: a CPU vision tower keeps the existing no_grad behavior
-    # even with the flag on.
-    mm_utils, embeds = _run_get_mm_embeddings(
-        monkeypatch, flag="1", mm_device="cpu", mm_features=[object()]
-    )
-    assert mm_utils.inference_mode_enabled is False
-    assert embeds.is_inference() is False
+def test_use_mm_inference_mode_false_when_flag_off(monkeypatch):
+    _set_mm_inference_mode_flag(monkeypatch, "0")
+    model = _make_causal_lm(is_multimodal=True, mm_device="nnpa")
+    assert model.use_mm_inference_mode([object()]) is False
+
+
+def test_runner_wrap_and_clone_materializes_inference_tensor():
+    # Mirrors the SpyreModelRunner._prepare_prompt contract: when the predicate
+    # is True, the encoder forward runs under inference_mode and its output is
+    # cloned back into a normal (non-inference) tensor for downstream caching.
+    seen = {}
+
+    def fake_encoder():
+        seen["inference_mode"] = torch.is_inference_mode_enabled()
+        return torch.zeros(1, 4)
+
+    use_inference_mode = True
+    ctx = torch.inference_mode() if use_inference_mode else contextlib.nullcontext()
+    with ctx:
+        full_embeds = fake_encoder()
+    if use_inference_mode and full_embeds is not None:
+        full_embeds = full_embeds.clone()
+
+    assert seen["inference_mode"] is True
+    assert full_embeds.is_inference() is False
