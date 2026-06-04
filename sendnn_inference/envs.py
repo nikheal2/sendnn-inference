@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     SENDNN_INFERENCE_MODEL_CONFIG_FILE: str | None = None
     SENDNN_INFERENCE_CPU_MM_DTYPE: torch.dtype = torch.float16
     SENDNN_INFERENCE_MM_DEVICE: str = "auto"
+    SENDNN_INFERENCE_MM_INFERENCE_MODE: bool = True
 
 logger = init_logger(__name__)
 
@@ -170,6 +171,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # torch.compile(backend="sendnn") regardless.
     "SENDNN_INFERENCE_MM_DEVICE": lambda: parse_mm_device(
         os.getenv("SENDNN_INFERENCE_MM_DEVICE", "auto")
+    ),
+    # Run the multimodal vision encoder forward under torch.inference_mode()
+    # instead of torch.no_grad(). Only applies when the encoder runs on the
+    # nnpa device (SENDNN_INFERENCE_MM_DEVICE resolves to "nnpa"); the Spyre
+    # LLM forward is unaffected. The encoder output is cloned out of inference
+    # mode before caching so downstream slicing stays legal. Default on.
+    "SENDNN_INFERENCE_MM_INFERENCE_MODE": lambda: bool(
+        int(os.getenv("SENDNN_INFERENCE_MM_INFERENCE_MODE", "1"))
     ),
 }
 # --8<-- [end:env-vars-definition]

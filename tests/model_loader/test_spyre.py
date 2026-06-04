@@ -190,3 +190,60 @@ def test_nnpa_text_only_model_never_registers_or_errors(monkeypatch):
     assert calls == []  # registration never attempted (short-circuited)
     assert ns.mm_device == "nnpa"
     assert _dtype_of(fms, "decoder.layers.0.weight") == torch.float16
+
+
+class _RecordingMMUtils:
+    """Records whether inference mode was active when the encoder ran, and
+    returns a tensor created under that context (so .is_inference() reflects it).
+    """
+
+    def __init__(self):
+        self.inference_mode_enabled = None
+
+    def get_maybe_mm_embeddings(self, fms_model, input_ids, mm_features, is_decode, mm_device):
+        self.inference_mode_enabled = torch.is_inference_mode_enabled()
+        return torch.zeros(1, 4)
+
+
+def _run_get_mm_embeddings(monkeypatch, *, flag, mm_device, mm_features):
+    monkeypatch.setenv("SENDNN_INFERENCE_MM_INFERENCE_MODE", flag)
+    envs.clear_env_cache()
+    mm_utils = _RecordingMMUtils()
+    ns = SimpleNamespace(
+        is_multimodal=True,
+        mm_model_utils=mm_utils,
+        fms_model=torch.nn.Module(),
+        mm_device=mm_device,
+    )
+    embeds = SpyreCausalLM.get_maybe_mm_embeddings(
+        ns, torch.zeros(1, 1, dtype=torch.int64), mm_features, is_decode=False
+    )
+    return mm_utils, embeds
+
+
+def test_nnpa_encoder_runs_under_inference_mode_and_is_materialized(monkeypatch):
+    # Flag on + encoder-on-nnpa: the forward runs under inference_mode, and the
+    # returned embeddings are cloned back into a normal (non-inference) tensor.
+    mm_utils, embeds = _run_get_mm_embeddings(
+        monkeypatch, flag="1", mm_device="nnpa", mm_features=[object()]
+    )
+    assert mm_utils.inference_mode_enabled is True
+    assert embeds.is_inference() is False
+
+
+def test_inference_mode_flag_off_keeps_no_grad(monkeypatch):
+    mm_utils, embeds = _run_get_mm_embeddings(
+        monkeypatch, flag="0", mm_device="nnpa", mm_features=[object()]
+    )
+    assert mm_utils.inference_mode_enabled is False
+    assert embeds.is_inference() is False
+
+
+def test_cpu_encoder_not_wrapped_in_inference_mode(monkeypatch):
+    # Scope is nnpa-only: a CPU vision tower keeps the existing no_grad behavior
+    # even with the flag on.
+    mm_utils, embeds = _run_get_mm_embeddings(
+        monkeypatch, flag="1", mm_device="cpu", mm_features=[object()]
+    )
+    assert mm_utils.inference_mode_enabled is False
+    assert embeds.is_inference() is False
