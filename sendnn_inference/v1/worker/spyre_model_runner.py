@@ -1,3 +1,4 @@
+import atexit
 import math
 import time
 import os
@@ -732,6 +733,8 @@ class ChunkedPrefillModelRunner(
         # Profiler is None until complete_warmup() fires so warmup compilation
         # noise is never captured.  Activated by SENDNN_INFERENCE_PROFILE_DIR.
         self._profiler: torch.profiler.profile | None = None
+        self._profile_steps_remaining = 0
+        self._profile_path = ""
 
         # Initialize performance metric logger for tracking embedding times
         self.perf_logger = create_perf_metric_logger(rank=rank)
@@ -801,31 +804,42 @@ class ChunkedPrefillModelRunner(
         # classes inherit from `nn.Module` when maybe they don't need to
         self.model.set_past_key_value_states(num_blocks=n_blocks_avail)
 
-                # Start profiler now that warmup (torch.compile + Dynamo) is complete.
+        # Start profiler now that warmup (torch.compile + Dynamo) is complete.
         # This ensures traces contain only real inference steps, not compilation.
+        # The trace is flushed after SENDNN_INFERENCE_PROFILE_STEPS execute_model
+        # calls, or on process exit (atexit) if the run is shorter than that, so a
+        # trace is always written.
         profile_dir = envs_spyre.SENDNN_INFERENCE_PROFILE_DIR
         if profile_dir:
             os.makedirs(profile_dir, exist_ok=True)
-            n_steps = envs_spyre.SENDNN_INFERENCE_PROFILE_STEPS
-
-            def _on_trace_ready(p: torch.profiler.profile) -> None:
-                path = os.path.join(profile_dir, f"trace_rank{self.rank}.json")
-                p.export_chrome_trace(path)
-                logger.info("[profiler rank %d] trace → %s", self.rank, path)
-
+            self._profile_steps_remaining = envs_spyre.SENDNN_INFERENCE_PROFILE_STEPS
+            self._profile_path = os.path.join(profile_dir, f"trace_rank{self.rank}.json")
             self._profiler = torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU],
-                schedule=torch.profiler.schedule(wait=0, warmup=0, active=n_steps, repeat=1),
-                on_trace_ready=_on_trace_ready,
                 record_shapes=False,
                 profile_memory=False,
                 with_stack=False,
             )
             self._profiler.start()
+            atexit.register(self._flush_profiler)
             logger.info(
-                "[profiler rank %d] started post-warmup — capturing %d decode steps → %s",
-                self.rank, n_steps, profile_dir,
+                "[profiler rank %d] started post-warmup — capturing up to %d steps → %s",
+                self.rank,
+                self._profile_steps_remaining,
+                profile_dir,
             )
+
+    def _flush_profiler(self) -> None:
+        prof = self._profiler
+        if prof is None:
+            return
+        self._profiler = None  # prevent double flush (step + atexit)
+        try:
+            prof.stop()
+            prof.export_chrome_trace(self._profile_path)
+            logger.info("[profiler rank %d] trace → %s", self.rank, self._profile_path)
+        except Exception:
+            logger.exception("[profiler rank %d] failed to export trace", self.rank)
 
     def _get_blocks(self, request_id: str) -> list[int]:
         return self.requests[request_id].block_ids
@@ -1667,7 +1681,8 @@ class ChunkedPrefillModelRunner(
             t_spyre_end = time.time()
             logger.debug(
                 "[rank %d] %s: spyre=%.2fms  total=%.2fms  cpu=%.2fms",
-                self.rank, step_label,
+                self.rank,
+                step_label,
                 (t_spyre_end - t_spyre_start) * 1000,
                 (t_spyre_end - t0) * 1000,
                 ((t_spyre_end - t0) - (t_spyre_end - t_spyre_start)) * 1000,
@@ -1681,7 +1696,9 @@ class ChunkedPrefillModelRunner(
                     return self.get_empty_output()
 
                 t1 = time.time() - t0
-                logger.debug("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", (t1 * 1000))
+                logger.debug(
+                    "t_forward_pass: %.2fms [prefill single chunk][batch size 1]", (t1 * 1000)
+                )
                 return self.prefill_output()
 
             # Apply grammar bitmask for structured output requests.
@@ -1706,6 +1723,9 @@ class ChunkedPrefillModelRunner(
         finally:
             if self._profiler is not None:
                 self._profiler.step()
+                self._profile_steps_remaining -= 1
+                if self._profile_steps_remaining <= 0:
+                    self._flush_profiler()
 
         # Get the right batch, if this is the last chunk to conclude the
         # prefill, we'll generate a token and we should get from the prefill
